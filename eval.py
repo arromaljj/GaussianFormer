@@ -67,6 +67,7 @@ def main(local_rank, args):
     n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
     logger.info(f'Number of params: {n_parameters}')
     if distributed:
+        print("DISTRIBUTED")
         if cfg.get('syncBN', True):
             my_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(my_model)
             logger.info('converted sync bn.')
@@ -80,17 +81,12 @@ def main(local_rank, args):
             find_unused_parameters=find_unused_parameters)
         raw_model = my_model.module
     else:
+        print("NOT DISTRIBUTED")
         my_model = my_model.cuda()
         raw_model = my_model
     logger.info('done ddp model')
 
-    train_dataset_loader, val_dataset_loader = get_dataloader(
-        cfg.train_dataset_config,
-        cfg.val_dataset_config,
-        cfg.train_loader,
-        cfg.val_loader,
-        dist=distributed,
-        val_only=True)
+
     
     # resume and load
     cfg.resume_from = ''
@@ -98,16 +94,19 @@ def main(local_rank, args):
         cfg.resume_from = osp.join(args.work_dir, 'latest.pth')
     if args.resume_from:
         cfg.resume_from = args.resume_from
-    
+    print("RESUME FROM: ", cfg.resume_from)
     logger.info('resume from: ' + cfg.resume_from)
     logger.info('work dir: ' + args.work_dir)
 
     if cfg.resume_from and osp.exists(cfg.resume_from):
+        print(f'Resuming checkpoint from {cfg.resume_from}')
         map_location = 'cpu'
+        print(cfg.resume_from)
         ckpt = torch.load(cfg.resume_from, map_location=map_location)
         raw_model.load_state_dict(ckpt.get("state_dict", ckpt), strict=True)
         print(f'successfully resumed.')
     elif cfg.load_from:
+        print(f'Loading checkpoint from {cfg.load_from}')
         ckpt = torch.load(cfg.load_from, map_location='cpu')
         if 'state_dict' in ckpt:
             state_dict = ckpt['state_dict']
@@ -116,10 +115,20 @@ def main(local_rank, args):
         try:
             print(raw_model.load_state_dict(state_dict, strict=False))
         except:
+            print("Failed to load state dict")
             from misc.checkpoint_util import refine_load_from_sd
             print(raw_model.load_state_dict(
                 refine_load_from_sd(state_dict), strict=False))
-        
+    print(my_model)
+    return
+    train_dataset_loader, val_dataset_loader = get_dataloader(
+    cfg.train_dataset_config,
+    cfg.val_dataset_config,
+    cfg.train_loader,
+    cfg.val_loader,
+    dist=distributed,
+    val_only=True)
+
     print_freq = cfg.print_freq
     from misc.metric_util import MeanIoU
     miou_metric = MeanIoU(

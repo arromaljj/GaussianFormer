@@ -113,6 +113,7 @@ We provide the following checkpoints trained on the SurroundOcc dataset:
 
 ```
 python eval.py --py-config config/xxxx.py --work-dir out/xxxx/ --resume-from out/xxxx/state_dict.pth
+python eval.py --py-config config/nuscenes_gs25600_solid.py --work-dir out --resume-from downloads/nonempty/nonempty.pth
 ```
 
 ### Train
