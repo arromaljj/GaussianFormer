@@ -38,5 +38,7 @@ cd model/head/localagg_prob_fast && pip install -e .
 
 ## 5. (Optional) For visualization
 ```bash
+apt-get update && apt-get install -y libxrender1 libxext6 libxtst6 libgl1-mesa-glx xvfb
+
 pip install pyvirtualdisplay mayavi matplotlib==3.7.2 PyQt5
 ```

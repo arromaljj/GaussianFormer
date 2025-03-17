@@ -392,7 +392,11 @@ def run_inference(model, images, camera_params=None, device='cuda'):
             'image_wh': image_wh,
             'occ_xyz': occ_xyz.reshape(1, 200, 200, 16, 3).repeat(batch_size, 1, 1, 1, 1).to(device),
             'cam_positions': torch.zeros(batch_size, num_cams, 3).to(device),
-            'focal_positions': torch.zeros(batch_size, num_cams, 3).to(device)
+            'focal_positions': torch.zeros(batch_size, num_cams, 3).to(device),
+            # Add dummy occ_label to avoid KeyError during inference
+            'occ_label': torch.zeros(batch_size, 200, 200, 16).long().to(device),
+            # Add dummy occ_cam_mask to avoid KeyError during inference
+            'occ_cam_mask': torch.ones(batch_size, 200, 200, 16, num_cams).bool().to(device)
         }
     else:
         # Use provided camera parameters
@@ -434,6 +438,15 @@ def run_inference(model, images, camera_params=None, device='cuda'):
                 metas[key] = tensor_value.to(device)
             else:
                 metas[key] = value
+                
+        # Add dummy occ_label to avoid KeyError during inference
+        if 'occ_label' not in metas:
+            metas['occ_label'] = torch.zeros(batch_size, 200, 200, 16).long().to(device)
+            
+        # Add dummy occ_cam_mask to avoid KeyError during inference
+        if 'occ_cam_mask' not in metas:
+            num_cams = images.shape[1]
+            metas['occ_cam_mask'] = torch.ones(batch_size, 200, 200, 16, num_cams).bool().to(device)
     
     # Run inference
     with torch.no_grad():
@@ -537,6 +550,13 @@ def prepare_nuscenes_camera_params(nusc, sample, camera_types):
     occ_xyz = get_meshgrid(ranges, grid, grid_size)
     results['occ_xyz'] = occ_xyz.reshape(1, 200, 200, 16, 3)
     
+    # Add dummy occ_label for inference
+    results['occ_label'] = np.zeros((1, 200, 200, 16), dtype=np.int64)
+    
+    # Add dummy occ_cam_mask for inference
+    num_cams = len(camera_types)
+    results['occ_cam_mask'] = np.ones((1, 200, 200, 16, num_cams), dtype=bool)
+    
     # Apply data pipeline transformations
     # This adapts the data to the format expected by the model
     adaptor = NuScenesAdaptor(use_ego=False, num_cams=6)
@@ -545,22 +565,514 @@ def prepare_nuscenes_camera_params(nusc, sample, camera_types):
     return results
 
 
-def inference_example(sample_idx=0, save_output=True, output_dir=None):
+def initialize_model(args):
     """
-    Example function showing how to use run_inference with sample images from a NuScenes scene.
+    Initialize the model with given arguments.
     
     Args:
-        sample_idx (int): Index of the NuScenes sample to use
-        save_output (bool): Whether to save the prediction visualization
-        output_dir (str): Directory to save the output visualization (defaults to out/viz)
+        args: Configuration parameters
+        
+    Returns:
+        model: Initialized model
+    """
+    print("==== MODEL INITIALIZATION START ====")
+    try:
+        env_manager = EnvironmentManager(0, args)
+        model_manager = ModelManager(env_manager)
+        model_manager.initialize()
+        model = model_manager.get_model()
+        print("✓ Model initialized successfully")
+        return model
+    except Exception as e:
+        print(f"✗ Model initialization failed: {str(e)}")
+        raise
+
+
+def load_nuscenes_data(sample_idx=0):
+    """
+    Load a sample from NuScenes dataset.
+    
+    Args:
+        sample_idx: Index of the sample to load
+        
+    Returns:
+        nusc: NuScenes instance
+        sample: NuScenes sample
+        camera_types: List of camera types
+        image_paths: List of image paths
+    """
+    print("\n==== NUSCENES DATA LOADING START ====")
+    try:
+        from nuscenes.nuscenes import NuScenes
+        
+        print("Loading NuScenes dataset...")
+        nusc = NuScenes(version='v1.0-mini', dataroot='data/nuscenes/', verbose=False)
+        
+        # Get the requested sample
+        if sample_idx >= len(nusc.sample):
+            print(f"Warning: Sample index {sample_idx} out of range, using first sample")
+            sample_idx = 0
+            
+        sample = nusc.sample[sample_idx]
+        print(f"✓ Loaded sample {sample_idx}, token: {sample['token']}")
+        
+        # Camera types used in NuScenes
+        camera_types = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 
+                      'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
+        
+        # Prepare image paths
+        image_paths = []
+        for cam in camera_types:
+            cam_token = sample['data'][cam]
+            cam_data = nusc.get('sample_data', cam_token)
+            img_path = os.path.join('data/nuscenes/', cam_data['filename'])
+            image_paths.append(img_path)
+        
+        print(f"✓ Prepared {len(image_paths)} camera image paths")
+        for i, path in enumerate(image_paths):
+            print(f"  - Camera {i} ({camera_types[i]}): {path}")
+            
+        return nusc, sample, camera_types, image_paths
+    except Exception as e:
+        print(f"✗ NuScenes data loading failed: {str(e)}")
+        raise
+
+
+def load_and_process_images(image_paths):
+    """
+    Load and preprocess images.
+    
+    Args:
+        image_paths: List of image paths
+        
+    Returns:
+        results: Dictionary with loaded and processed images
+    """
+    print("\n==== IMAGE LOADING START ====")
+    try:
+        # Load images using LoadMultiViewImageFromFiles
+        image_loader = LoadMultiViewImageFromFiles(to_float32=True)
+        results = image_loader(image_paths)
+        
+        if 'img' in results:
+            img_shapes = [img.shape for img in results['img']]
+            print(f"✓ Successfully loaded {len(results['img'])} images with shapes: {img_shapes}")
+        else:
+            print("✗ Failed to load images: 'img' key not found in results")
+            
+        return results
+    except Exception as e:
+        print(f"✗ Image loading failed: {str(e)}")
+        raise
+
+
+def prepare_inputs(results, camera_params):
+    """
+    Prepare the inputs for model inference.
+    
+    Args:
+        results: Dictionary with loaded images
+        camera_params: Camera parameters
+        
+    Returns:
+        results: Updated results dictionary
+        inference_camera_params: Parameters for inference
+    """
+    print("\n==== INPUT PREPARATION START ====")
+    try:
+        # Add camera parameters to results
+        print("Adding camera parameters to results...")
+        for key, value in camera_params.items():
+            results[key] = value
+            if key in ['projection_mat', 'occ_xyz', 'image_wh', 'occ_label', 'occ_cam_mask']:
+                shape_info = f"shape: {np.array(value).shape}" if hasattr(value, 'shape') else type(value)
+                print(f"  - Added {key} ({shape_info})")
+        
+        # Normalize images
+        print("Normalizing images...")
+        img_norm_cfg = dict(
+            mean=[123.675, 116.28, 103.53],
+            std=[58.395, 57.12, 57.375],
+            to_rgb=True
+        )
+        normalizer = NormalizeMultiviewImage(**img_norm_cfg)
+        results = normalizer(results)
+        print(f"✓ Normalized images with mean={img_norm_cfg['mean']}, std={img_norm_cfg['std']}")
+        
+        # Format data
+        print("Formatting data for model input...")
+        formatter = DefaultFormatBundle()
+        results = formatter(results)
+        
+        # Prepare model input images
+        if isinstance(results['img'], torch.Tensor):
+            images = results['img']
+            if len(images.shape) == 4:  # [N, C, H, W]
+                images = images.unsqueeze(0)
+            print(f"✓ Prepared model input images with shape: {images.shape}")
+        else:
+            raise ValueError(f"Unexpected image format: {type(results['img'])}")
+        
+        # Prepare camera parameters for run_inference
+        inference_camera_params = {
+            'projection_mat': results['projection_mat'],
+            'image_wh': results['image_wh'] if 'image_wh' in results else np.array([[1600, 900]] * 6),
+            'occ_xyz': results['occ_xyz'] if 'occ_xyz' in results else None,
+            'occ_label': results['occ_label'] if 'occ_label' in results else np.zeros((1, 200, 200, 16), dtype=np.int64),
+            'occ_cam_mask': results['occ_cam_mask'] if 'occ_cam_mask' in results else np.ones((1, 200, 200, 16, 6), dtype=bool),
+        }
+        print("✓ Prepared camera parameters for inference")
+        
+        return results, inference_camera_params
+    except Exception as e:
+        print(f"✗ Input preparation failed: {str(e)}")
+        raise
+
+
+def run_model_inference(model, images, camera_params):
+    """
+    Run model inference.
+    
+    Args:
+        model: Model to run
+        images: Input images
+        camera_params: Camera parameters
+        
+    Returns:
+        inference_results: Model prediction results
+    """
+    print("\n==== MODEL INFERENCE START ====")
+    try:
+        print(f"Running inference with images shape: {images.shape}")
+        print(f"Camera parameters keys: {list(camera_params.keys())}")
+        
+        # Print each parameter's shape for debugging
+        for key, value in camera_params.items():
+            if hasattr(value, 'shape'):
+                print(f"  - {key} shape: {value.shape}")
+                
+        # Debug check for essential keys
+        essential_keys = ['projection_mat', 'image_wh', 'occ_xyz', 'occ_label', 'occ_cam_mask']
+        missing_keys = [key for key in essential_keys if key not in camera_params]
+        if missing_keys:
+            print(f"⚠️ WARNING: Missing essential keys: {missing_keys}")
+            
+        # Check tensor device consistency
+        device_info = {}
+        for key, value in camera_params.items():
+            if isinstance(value, torch.Tensor):
+                device_info[key] = value.device
+        if len(set(device_info.values())) > 1:
+            print(f"⚠️ WARNING: Inconsistent tensor devices: {device_info}")
+        
+        print("Running inference...")
+        inference_results = run_inference(model, images, camera_params)
+        
+        # Print inference results
+        print("Inference completed successfully! Results keys:")
+        for key in inference_results.keys():
+            if hasattr(inference_results[key], 'shape'):
+                print(f"  - {key}: shape {inference_results[key].shape}")
+            else:
+                print(f"  - {key}: {type(inference_results[key])}")
+                
+        return inference_results
+    except Exception as e:
+        print(f"✗ Model inference failed: {str(e)}")
+        # Print additional debug info
+        print("\n=== DEBUG INFO FOR MODEL INFERENCE ERROR ===")
+        
+        if hasattr(e, '__traceback__'):
+            import traceback
+            traceback.print_exc()
+            
+        # Check if error is due to missing key
+        if isinstance(e, KeyError):
+            print(f"\nMissing key: '{str(e)}'")
+            print(f"Available keys in camera_params: {list(camera_params.keys())}")
+            # If it's a missing key in metas dict inside model
+            print(f"\nTry adding this key to both run_inference and prepare_nuscenes_camera_params functions!")
+        
+        raise
+
+
+def save_input_images(image_paths, results_img, sample_idx, output_dir):
+    """
+    Save the input camera images used for inference.
+    
+    Args:
+        image_paths: Original paths to the camera images
+        results_img: Processed image tensor from inference
+        sample_idx: Sample index
+        output_dir: Directory to save images
+    """
+    print(f"\n==== SAVING INPUT IMAGES ====")
+    try:
+        # Create directory for images
+        image_dir = os.path.join(output_dir, f"sample_{sample_idx}", "input_images")
+        os.makedirs(image_dir, exist_ok=True)
+        
+        # Save original images
+        camera_types = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 
+                       'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
+        
+        for i, img_path in enumerate(image_paths):
+            # Copy original image
+            img = cv2.imread(img_path)
+            if img is not None:
+                output_path = os.path.join(image_dir, f"{camera_types[i]}.jpg")
+                cv2.imwrite(output_path, img)
+                print(f"  ✓ Saved {camera_types[i]} image to {output_path}")
+            else:
+                print(f"  ✗ Failed to save {camera_types[i]} image - could not read original")
+        
+        # If processed image tensor is available (already normalized, might look different)
+        if isinstance(results_img, torch.Tensor):
+            processed_dir = os.path.join(image_dir, "processed")
+            os.makedirs(processed_dir, exist_ok=True)
+            
+            # Handle different tensor formats
+            if len(results_img.shape) == 5:  # [B, N, C, H, W]
+                imgs = results_img[0]  # Take first batch
+            elif len(results_img.shape) == 4:  # [N, C, H, W]
+                imgs = results_img
+            else:
+                print(f"  ✗ Unexpected image tensor shape: {results_img.shape}")
+                return
+                
+            # Save processed images
+            for i in range(min(len(camera_types), imgs.shape[0])):
+                img = imgs[i].permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                
+                # Denormalize if needed (approximately)
+                img = img * np.array([58.395, 57.12, 57.375]) + np.array([123.675, 116.28, 103.53])
+                img = np.clip(img, 0, 255).astype(np.uint8)
+                
+                # Convert RGB to BGR for OpenCV
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                
+                output_path = os.path.join(processed_dir, f"{camera_types[i]}_processed.jpg")
+                cv2.imwrite(output_path, img)
+                print(f"  ✓ Saved processed {camera_types[i]} image to {output_path}")
+        
+        print(f"✓ All available input images saved to {image_dir}")
+        return image_dir
+    except Exception as e:
+        print(f"✗ Failed to save input images: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def process_and_save_results(inference_results, sample_idx, save_output, output_dir, image_paths=None, input_images=None):
+    """
+    Process and save inference results.
+    
+    Args:
+        inference_results: Model prediction results
+        sample_idx: Sample index
+        save_output: Whether to save visualization
+        output_dir: Directory to save visualizations
+        image_paths: Original image paths for saving input images
+        input_images: Processed input image tensor for saving
+        
+    Returns:
+        occupancy_pred: Processed occupancy predictions
+    """
+    print("\n==== RESULTS PROCESSING START ====")
+    try:
+        # Create sample directory
+        if output_dir is None:
+            output_dir = 'out/results'
+        
+        sample_dir = os.path.join(output_dir, f"sample_{sample_idx}")
+        os.makedirs(sample_dir, exist_ok=True)
+        
+        # Process the results
+        if 'final_occ' not in inference_results:
+            print(f"✗ 'final_occ' not found in inference results. Available keys: {list(inference_results.keys())}")
+            return None
+            
+        occupancy_pred = inference_results['final_occ'][0]  # First batch item
+        
+        # Convert to numpy if needed
+        if isinstance(occupancy_pred, torch.Tensor):
+            occupancy_pred = occupancy_pred.cpu().numpy()
+        
+        print(f"✓ Processed occupancy prediction with shape: {occupancy_pred.shape}")
+        
+        # Save raw prediction data
+        pred_dir = os.path.join(sample_dir, "predictions")
+        os.makedirs(pred_dir, exist_ok=True)
+        
+        # Save the raw data first (always do this)
+        raw_output_path = os.path.join(pred_dir, "occupancy_pred_raw.npy")
+        np.save(raw_output_path, occupancy_pred)
+        print(f"✓ Raw prediction data saved to {raw_output_path}")
+        
+        # Save reshaping metadata to help with later analysis
+        original_shape = occupancy_pred.shape
+        if len(original_shape) == 1:
+            # If flattened, typical shape would be [200*200*16, num_classes]
+            # or just [200*200*16] for a single-class prediction
+            suggested_reshape = "(200, 200, 16, X)" if len(original_shape) > 1 else "(200, 200, 16)"
+            with open(os.path.join(pred_dir, "reshape_info.txt"), "w") as f:
+                f.write(f"Original shape: {original_shape}\n")
+                f.write(f"Suggested reshape: {suggested_reshape}\n")
+                f.write("Occupancy grid dimensions: 200x200x16\n")
+                f.write("Spatial extent: x=[-50,50], y=[-50,50], z=[-5,3]\n")
+                f.write("Grid resolution: 0.5 meters\n")
+        
+        # Try to save reshaped data if we can determine the shape
+        try:
+            if len(original_shape) == 1:
+                # Assume standard 200x200x16 occupancy grid
+                if occupancy_pred.size == 200*200*16:
+                    reshaped = occupancy_pred.reshape(200, 200, 16)
+                    np.save(os.path.join(pred_dir, "occupancy_pred_reshaped.npy"), reshaped)
+                    print(f"✓ Reshaped prediction data saved (200x200x16)")
+                elif occupancy_pred.size % (200*200*16) == 0:
+                    # Multi-class case
+                    num_classes = occupancy_pred.size // (200*200*16)
+                    reshaped = occupancy_pred.reshape(200, 200, 16, num_classes)
+                    np.save(os.path.join(pred_dir, "occupancy_pred_reshaped.npy"), reshaped)
+                    print(f"✓ Reshaped prediction data saved (200x200x16x{num_classes})")
+        except Exception as e:
+            print(f"⚠️ Could not save reshaped prediction: {str(e)}")
+        
+        # Save input images if available
+        if image_paths is not None and input_images is not None:
+            save_input_images(image_paths, input_images, sample_idx, output_dir)
+        
+        # Visualize results if requested
+        if save_output:
+            try:
+                from vis import save_occ
+                
+                vis_dir = os.path.join(sample_dir, "visualizations")
+                os.makedirs(vis_dir, exist_ok=True)
+                
+                print(f"Saving visualization to {vis_dir}...")
+                
+                # Try to determine correct shape for visualization
+                viz_data = occupancy_pred
+                if len(occupancy_pred.shape) == 1:
+                    # Assume it's flattened - try to reshape for visualization
+                    if occupancy_pred.size == 200*200*16:
+                        viz_data = occupancy_pred.reshape(1, 200, 200, 16)
+                    elif occupancy_pred.size % (200*200*16) == 0:
+                        # Multi-class case, reshape and take argmax for visualization
+                        num_classes = occupancy_pred.size // (200*200*16)
+                        reshaped = occupancy_pred.reshape(200, 200, 16, num_classes)
+                        viz_data = np.argmax(reshaped, axis=-1).reshape(1, 200, 200, 16)
+                elif len(occupancy_pred.shape) > 1:
+                    # Already has a shape but may need batch dimension
+                    if len(occupancy_pred.shape) == 3:  # [200, 200, 16]
+                        viz_data = occupancy_pred.reshape(1, 200, 200, 16)
+                
+                # Save prediction visualization
+                save_occ(
+                    vis_dir,
+                    viz_data,
+                    f'sample_{sample_idx}_pred',
+                    True, 0
+                )
+                print(f"✓ Visualization saved to {vis_dir}/sample_{sample_idx}_pred.png")
+            except Exception as e:
+                print(f"✗ Visualization failed: {str(e)}")
+                print("Note: This is expected in headless environments. Use the saved .npy files for visualization elsewhere.")
+        
+        print(f"\n==== RESULTS SUMMARY ====")
+        print(f"✓ All results saved to: {sample_dir}")
+        print(f"  - Raw predictions: {pred_dir}/occupancy_pred_raw.npy")
+        if image_paths is not None:
+            print(f"  - Input images: {sample_dir}/input_images/")
+        if save_output:
+            print(f"  - Visualizations: {sample_dir}/visualizations/ (if successful)")
+        print(f"\nTo analyze these results on another machine:")
+        print(f"1. Download the entire '{output_dir}' directory")
+        print(f"2. Load the raw predictions with: np.load('occupancy_pred_raw.npy')")
+        print(f"3. Check reshape_info.txt for guidance on reshaping the prediction data")
+        
+        return occupancy_pred
+    except Exception as e:
+        print(f"✗ Results processing failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def inference_example(sample_idx=0, save_output=True, output_dir=None):
+    """
+    Run complete inference pipeline example.
+    
+    Args:
+        sample_idx: Index of the NuScenes sample to use
+        save_output: Whether to save the prediction visualization
+        output_dir: Directory to save the output visualization
         
     Returns:
         dict: Model predictions
     """
-    print("Starting inference example...")
-    from nuscenes.nuscenes import NuScenes
+    print("\n====== STARTING INFERENCE EXAMPLE ======")
     
-    # Initialize environment and model
+    try:
+        # 1. Initialize environment and model
+        args = argparse.Namespace(
+            py_config='config/nuscenes_gs25600_solid.py',
+            work_dir='out',
+            resume_from='downloads/nonempty/nonempty.pth',
+            seed=42,
+            gpus=torch.cuda.device_count(),
+            vis_occ=False
+        )
+        
+        if output_dir is None:
+            output_dir = os.path.join(args.work_dir, 'results')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Initialize model
+        model = initialize_model(args)
+        
+        # 2. Load NuScenes data
+        nusc, sample, camera_types, image_paths = load_nuscenes_data(sample_idx)
+        
+        # 3. Load and preprocess images
+        results = load_and_process_images(image_paths)
+        
+        # 4. Get camera parameters
+        print("\n==== CAMERA PARAMETERS PREPARATION START ====")
+        camera_params = prepare_nuscenes_camera_params(nusc, sample, camera_types)
+        print(f"✓ Prepared camera parameters with keys: {list(camera_params.keys())}")
+        
+        # 5. Prepare inputs and camera parameters
+        results, inference_camera_params = prepare_inputs(results, camera_params)
+        
+        # 6. Run inference
+        inference_results = run_model_inference(model, results['img'], inference_camera_params)
+        
+        # 7. Process and save results (now passing image paths and processed images)
+        occupancy_pred = process_and_save_results(
+            inference_results, 
+            sample_idx, 
+            save_output, 
+            output_dir,
+            image_paths=image_paths,
+            input_images=results['img']
+        )
+        
+        print("\n====== INFERENCE EXAMPLE COMPLETED SUCCESSFULLY ======")
+        return inference_results
+        
+    except Exception as e:
+        print(f"\n✗✗✗ INFERENCE EXAMPLE FAILED: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {'error': str(e)}
+
+
+if __name__ == "__main__":
+    # Use a fixed args object instead of command line parsing
     args = argparse.Namespace(
         py_config='config/nuscenes_gs25600_solid.py',
         work_dir='out',
@@ -570,147 +1082,12 @@ def inference_example(sample_idx=0, save_output=True, output_dir=None):
         vis_occ=False
     )
     
-    if output_dir is None:
-        output_dir = os.path.join(args.work_dir, 'viz')
-    os.makedirs(output_dir, exist_ok=True)
-    
-    env_manager = EnvironmentManager(0, args)
-    model_manager = ModelManager(env_manager)
-    model_manager.initialize()
-    model = model_manager.get_model()
-    
-    # Load a sample from NuScenes
-    print("Loading NuScenes data...")
-    nusc = NuScenes(version='v1.0-mini', dataroot='data/nuscenes/', verbose=False)
-    
-    # Get the requested sample
-    if sample_idx >= len(nusc.sample):
-        print(f"Warning: Sample index {sample_idx} out of range, using first sample")
-        sample_idx = 0
-        
-    sample = nusc.sample[sample_idx]
-    print(f"Running inference on sample {sample_idx}, token: {sample['token']}")
-    
-    # Camera types used in NuScenes
-    camera_types = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 
-                  'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
-    
-    # Prepare image paths
-    image_paths = []
-    for cam in camera_types:
-        cam_token = sample['data'][cam]
-        cam_data = nusc.get('sample_data', cam_token)
-        img_path = os.path.join('data/nuscenes/', cam_data['filename'])
-        image_paths.append(img_path)
-        print(f"Image path: {img_path}")
-    
-    # Setup data pipeline
-    print("Setting up data pipeline...")
-    # 1. Load images using LoadMultiViewImageFromFiles
-    image_loader = LoadMultiViewImageFromFiles(to_float32=True)
-    results = image_loader(image_paths)
-    
-    # 2. Get camera parameters
-    print("Preparing camera parameters...")
-    camera_params = prepare_nuscenes_camera_params(nusc, sample, camera_types)
-    
-    # Add camera parameters to results
-    for key, value in camera_params.items():
-        results[key] = value
-    
-    # 3. Normalize images
-    img_norm_cfg = dict(
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
-        to_rgb=True
-    )
-    normalizer = NormalizeMultiviewImage(**img_norm_cfg)
-    results = normalizer(results)
-    
-    # 4. Format data
-    formatter = DefaultFormatBundle()
-    results = formatter(results)
-    
-    # Run inference
-    print("Running model inference...")
-    if isinstance(results['img'], torch.Tensor):
-        # Model expects [B, N, C, H, W]
-        images = results['img']
-        if len(images.shape) == 4:  # [N, C, H, W]
-            images = images.unsqueeze(0)
-    else:
-        raise ValueError(f"Unexpected image format: {type(results['img'])}")
-    
-    # Prepare camera parameters for run_inference
-    inference_camera_params = {
-        'projection_mat': results['projection_mat'],
-        'image_wh': results['image_wh'] if 'image_wh' in results else np.array([[1600, 900]] * 6),
-        'occ_xyz': results['occ_xyz'] if 'occ_xyz' in results else None,
-    }
-    
-    # Run inference
-    inference_results = run_inference(model, images, inference_camera_params)
-    
-    # Process the results
-    occupancy_pred = inference_results['final_occ'][0]  # First batch item
-    
-    # Convert to numpy if needed
-    if isinstance(occupancy_pred, torch.Tensor):
-        occupancy_pred = occupancy_pred.cpu().numpy()
-    
-    print(f"Occupancy prediction shape: {occupancy_pred.shape}")
-    
-    # Visualize results if requested
-    if save_output:
-        try:
-            from vis import save_occ
-            
-            vis_dir = output_dir
-            os.makedirs(vis_dir, exist_ok=True)
-            
-            # Save prediction visualization
-            save_occ(
-                vis_dir,
-                occupancy_pred.reshape(1, 200, 200, 16),
-                f'sample_{sample_idx}_pred',
-                True, 0
-            )
-            print(f"Visualization saved to {vis_dir}/sample_{sample_idx}_pred.png")
-        except Exception as e:
-            print(f"Visualization failed: {str(e)}")
-    
-    return inference_results
-
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Run GaussianFormer inference')
-    parser.add_argument('--py-config', type=str, default='config/nuscenes_gs25600_solid.py',
-                      help='Path to config file')
-    parser.add_argument('--work-dir', type=str, default='out',
-                      help='Working directory')
-    parser.add_argument('--resume-from', type=str, default='downloads/nonempty/nonempty.pth',
-                      help='Path to checkpoint file')
-    parser.add_argument('--seed', type=int, default=42, 
-                      help='Random seed')
-    parser.add_argument('--gpus', type=int, default=torch.cuda.device_count(),
-                      help='Number of GPUs to use')
-    parser.add_argument('--sample-idx', type=int, default=0,
-                      help='Sample index to use for inference example')
-    parser.add_argument('--output-dir', type=str, default=None,
-                      help='Directory to save visualization outputs')
-    parser.add_argument('--save-output', action='store_true',
-                      help='Save visualization output')
-    
-    args = parser.parse_args()
-    
     # Run inference example
-    print(f"Running inference on sample {args.sample_idx}...")
+    print(f"Running inference on sample 0...")
     results = inference_example(
-        sample_idx=args.sample_idx,
-        save_output=args.save_output,
-        output_dir=args.output_dir
+        sample_idx=0,
+        save_output=True,
+        output_dir=None
     )
     
     print("Inference completed successfully!") 

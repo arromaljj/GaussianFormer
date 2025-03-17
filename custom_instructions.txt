@@ -1,0 +1,1 @@
+Whent trying to understand the codebase, do not search inference_util.py inference.py simple_inference.py gaussianformer.ipynb download_data.py requirements_download.txt since these are all files we have created and contains bad or incorrect code. Please remember this wisely. 
