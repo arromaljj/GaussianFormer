@@ -10,15 +10,12 @@ from tqdm import tqdm
 
 # Array of downloads: each item contains [filename_to_save_as, download_url]
 DOWNLOADS = [
-    ["nuscenes_infos_val_sweeps_lid.pkl", "https://cloud.tsinghua.edu.cn/d/bb96379a3e46442c8898/files/?p=%2Fnuscenes_infos_val_sweeps_lid.pkl&dl=1"],
-    # ["nonempty.pth", "https://cloud.tsinghua.edu.cn/f/d1766fff8ad74756920b/?dl=1"]
-    # ["prob_64_state_dict.pth", "https://cloud.tsinghua.edu.cn/f/d041974bd900419fb141/?dl=1"],
+    # ["nuscenes_infos_val_sweeps_lid.pkl", "https://cloud.tsinghua.edu.cn/d/bb96379a3e46442c8898/files/?p=%2Fnuscenes_infos_val_sweeps_lid.pkl&dl=1"],
+    ["nonempty.pth", "https://cloud.tsinghua.edu.cn/f/d1766fff8ad74756920b/?dl=1"],
+    ["prob_64_state_dict.pth", "https://cloud.tsinghua.edu.cn/f/d041974bd900419fb141/?dl=1"],
     # ["v1.0-mini.tgz", "https://d36yt3mvayqw5m.cloudfront.net/public/v1.0/v1.0-mini.tgz"],
     # ["nuscenes_infos_val.pkl", "https://cloud.tsinghua.edu.cn/d/8dcb547238144d08a0bb/files/?p=%2Fnuscenes_infos_val.pkl&dl=1"],
     # ["val.zip", "https://cloud.tsinghua.edu.cn/d/8dcb547238144d08a0bb/files/?p=%2Fval.zip&dl=1"]
-    # ["model_weights.pth", "https://example.com/model_weights.pth"],
-    # ["sample_images.tar.gz", "https://example.com/sample_images.tar.gz"],
-    # Add more downloads as needed
 ]
 
 def download_file(url, destination_path):

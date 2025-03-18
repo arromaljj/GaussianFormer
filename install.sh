@@ -88,6 +88,7 @@ fi
 
 # 6. Install visualization packages (optional)
 echo "=== Installing visualization packages ==="
+apt-get update && apt-get install -y libxrender1 libxext6 libxtst6 libgl1-mesa-glx xvfb
 pip install pyvirtualdisplay mayavi matplotlib==3.7.2 PyQt5 || { echo "Warning: Failed to install some visualization packages"; }
 
 # 7. Download pretrained weights for image backbone
